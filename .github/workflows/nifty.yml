@@ -1,0 +1,57 @@
+name: nifty
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "0 = LIVE (paper trade)  |  1 = TEST (abhi check, koi trade save nahi)"
+        required: true
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nifty-algo
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install requests
+
+      - name: Run nifty
+        env:
+          # Neeche ke 3 secret ke naam apne AAG wale secrets se match karo.
+          # Naam alag ho to sirf "secrets.XXXX" wala hissa badlo.
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python nifty/nifty_algo.py ${{ github.event.inputs.mode }}
+
+      - name: Save state and trades.csv
+        if: always() && github.event.inputs.mode == '0'
+        run: |
+          git config user.name "nifty-bot"
+          git config user.email "nifty-bot@users.noreply.github.com"
+          git add nifty/state.json nifty/trades.csv 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "nifty: state/trades update"
+            for i in 1 2 3 4; do
+              git pull --rebase && git push && break
+              sleep 5
+            done
+          fi
