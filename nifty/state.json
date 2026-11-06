@@ -1,0 +1,26 @@
+{
+ "date": "2026-11-06",
+ "trades": 1,
+ "last_candle": "2026-11-06T13:10:00+05:30",
+ "pos": null,
+ "done": [
+  {
+   "date": "2026-11-06",
+   "trade_no": 1,
+   "side": "CE",
+   "entry_time": "09:40:23",
+   "spot_entry": 24552.7,
+   "strike": 24400.0,
+   "expiry": "2026-11-09",
+   "delta": 0.676,
+   "option_entry": 242.0,
+   "qty": 65,
+   "exit_time": "13:16:03",
+   "spot_exit": 24732.75,
+   "option_exit": 396.55,
+   "exit_reason": "TARGET",
+   "pnl": 10045.75
+  }
+ ],
+ "holiday_checked": true
+}
