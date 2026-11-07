@@ -6,6 +6,12 @@ Usage:  python nifty_algo.py 0   -> LIVE (paper) : follows market window 09:20-1
         python nifty_algo.py 1   -> TEST         : runs right now, any time, checks
                                                    everything and sends a TEST report
                                                    to Telegram. No state / CSV saved.
+
+Rules:
+- Pehla crossover (upar = CE buy, niche = PE buy) -> trade, entry crossover candle close par.
+- SL = entry candle se pehle ki candle ka low (CE) / high (PE)  [spot par].
+- 1:1 par 1 lot book, bacha lot cost-to-cost (SL = entry spot), target 1:2 (spot par).
+- SL / target ke pehle ulta crossover aaye to chalti trade band + nayi trade.
 """
 import os
 import sys
@@ -23,17 +29,20 @@ import requests
 FAST_EMA = 9
 SLOW_EMA = 21
 TARGET_DELTA = 0.7        # CE ke liye +0.7, PE ke liye -0.7 ke sabse paas wala strike
-SL_CANDLES = 2            # SL = pichhli 2 candle (5 min) ka low (CE) / high (PE), spot par
-SL_INCLUDE_ENTRY_CANDLE = False   # False = entry (crossover) candle se PEHLE ki 2 candle
-                                  # True  = entry candle + uski pichhli 1 candle
-RR = 2.0                  # target = risk ka 2 guna (1:2), spot par
+SL_CANDLES = 1            # SL = pichhli itni candle (5 min) ka low (CE) / high (PE), spot par
+SL_INCLUDE_ENTRY_CANDLE = False   # False = entry (crossover) candle se PEHLE ki candle
+                                  # True  = entry candle bhi gino
+R1 = 1.0                  # is RR par pehla lot book (1:1), spot par
+RR = 2.0                  # bache lot ka target (1:2), spot par
+LOTS = 2                  # kul lot (kam se kam 2 rakhna)
+BOOK_LOTS = 1             # R1 par kitne lot book honge; baaki cost-to-cost (SL = entry)
 WINDOW_START = "09:20"    # is time ke baad shuru hue candle ka signal liya jayega
 WINDOW_END = "15:15"      # sab position force close
 LAST_CANDLE_START = "15:10"   # ye candle 15:15 par close hota hai (last entry)
 MAX_TRADES = 2            # poore din mein total (CE + PE)
-LOTS = 1
 DEFAULT_LOT_SIZE = 65     # sirf tab use hoga jab Upstox lot size na de
 POLL_SECONDS = 15         # position khuli ho to spot kitne second mein check hoga
+PNL_UPDATE_MINUTES = 5    # position khuli ho to har itne minute mein Telegram PnL
 # ========================================================================
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -47,9 +56,14 @@ TOKEN = os.environ.get("UPSTOX_TOKEN", "")
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-CSV_COLS = ["date", "trade_no", "side", "entry_time", "spot_entry", "strike",
-            "expiry", "delta", "option_entry", "qty", "exit_time", "spot_exit",
-            "option_exit", "exit_reason", "pnl"]
+CSV_COLS = ["date", "trade_no", "side", "entry_time", "spot_entry", "sl_spot",
+            "target_spot", "strike", "expiry", "delta", "option_entry", "lots",
+            "qty_per_lot",
+            "leg1_lots", "leg1_time", "leg1_spot", "leg1_option", "leg1_reason",
+            "leg1_pnl",
+            "leg2_lots", "leg2_time", "leg2_spot", "leg2_option", "leg2_reason",
+            "leg2_pnl",
+            "exit_time", "total_pnl"]
 
 
 # ------------------------------ helpers ------------------------------
@@ -64,6 +78,11 @@ def hm(s):
 
 def at(d, s):
     return dt.datetime.combine(d, hm(s), tzinfo=IST)
+
+
+def bnd(t):
+    """t ka pichhla 5 min boundary."""
+    return t.replace(minute=t.minute // 5 * 5, second=0, microsecond=0)
 
 
 def log(*a):
@@ -211,7 +230,7 @@ def pick_strike(side, expiry):
 # ------------------------------ state / csv ------------------------------
 def fresh_state(day):
     return {"date": str(day), "trades": 0, "last_candle": "", "pos": None,
-            "done": [], "holiday_checked": False}
+            "done": [], "holiday_checked": False, "last_pnl_slot": ""}
 
 
 def load_state(day):
@@ -219,6 +238,7 @@ def load_state(day):
         with open(STATE_FILE) as f:
             st = json.load(f)
         if st.get("date") == str(day):
+            st.setdefault("last_pnl_slot", "")
             return st
     except Exception:
         pass
@@ -231,6 +251,16 @@ def save_state(st):
 
 
 def append_csv(row):
+    # purani format ki file ho to side mein rakh do, naya header banega
+    if os.path.exists(CSV_FILE):
+        try:
+            with open(CSV_FILE) as f:
+                head = f.readline().strip()
+        except Exception:
+            head = ""
+        if head != ",".join(CSV_COLS):
+            os.replace(CSV_FILE, CSV_FILE.replace(
+                ".csv", f"_old_{int(time.time())}.csv"))
     new = not os.path.exists(CSV_FILE)
     with open(CSV_FILE, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CSV_COLS)
@@ -240,8 +270,9 @@ def append_csv(row):
 
 
 def levels(side, entry, candles, k):
-    """candles[k] = entry candle. SL pichhli SL_CANDLES candle ke low (CE) /
-    high (PE) par, target = RR x risk. Sab spot par. Valid na ho to None."""
+    """candles[k] = entry candle. SL = pichhli SL_CANDLES candle ka low (CE) /
+    high (PE). R1 = 1:1 level, tgt = 1:RR level. Sab spot par.
+    Valid na ho to None."""
     end = k + 1 if SL_INCLUDE_ENTRY_CANDLE else k
     prior = candles[max(0, end - SL_CANDLES):end]
     if not prior:
@@ -251,12 +282,12 @@ def levels(side, entry, candles, k):
         risk = entry - sl
         if risk <= 0:
             return None
-        return sl, entry + RR * risk
+        return sl, entry + R1 * risk, entry + RR * risk
     sl = max(c["h"] for c in prior)
     risk = sl - entry
     if risk <= 0:
         return None
-    return sl, entry - RR * risk
+    return sl, entry - R1 * risk, entry - RR * risk
 
 
 # ------------------------------ live trading ------------------------------
@@ -267,7 +298,7 @@ def enter(st, side, cs, ts):
         tg(f"⚠️ nifty: {side} signal aaya par SL valid nahi (spot SL ke "
            f"galat side par). Trade skip.")
         return
-    sl, tgt = lv
+    sl, r1, tgt = lv
     info = contract_info()
     pick = pick_strike(side, info["expiry"])
     if not pick:
@@ -278,51 +309,166 @@ def enter(st, side, cs, ts):
     st["pos"] = {
         "no": st["trades"], "side": side, "strike": pick["strike"],
         "key": pick["key"], "expiry": info["expiry"], "delta": pick["delta"],
-        "qty": info["lot"] * LOTS, "spot_entry": spot, "sl": sl, "tgt": tgt,
-        "opt_entry": pick["ltp"], "entry_time": now().strftime("%H:%M:%S"),
+        "lot_size": info["lot"], "lots_total": LOTS, "lots_open": LOTS,
+        "spot_entry": spot, "sl0": sl, "sl": sl, "r1": r1, "tgt": tgt,
+        "stage": 0, "opt_entry": pick["ltp"],
+        "entry_time": now().strftime("%H:%M:%S"),
+        "legs": [], "booked_pnl": 0.0,
     }
+    st["last_pnl_slot"] = bnd(now()).isoformat()
     save_state(st)
     p = st["pos"]
-    tg(f"🟢 NIFTY ENTRY #{p['no']} — {side} BUY\n"
+    tg(f"🟢 NIFTY ENTRY #{p['no']} — {side} BUY ({LOTS} lot)\n"
        f"Candle: {ts.strftime('%H:%M')} close, EMA {FAST_EMA}/{SLOW_EMA} "
        f"{'upar' if side == 'CE' else 'niche'} cross\n"
        f"Spot: {spot:.2f}\n"
        f"Strike: {p['strike']} {side} (delta {p['delta']:.2f}), "
        f"expiry {p['expiry']}\n"
-       f"Premium entry: {p['opt_entry']:.2f} | Qty: {p['qty']}\n"
-       f"SL spot: {sl:.2f} ({abs(spot - sl):.1f} pts) | "
-       f"Target spot: {tgt:.2f} ({abs(tgt - spot):.1f} pts) | RR 1:{RR:g}")
+       f"Premium entry: {p['opt_entry']:.2f} | Qty: {p['lot_size'] * LOTS}\n"
+       f"SL spot: {sl:.2f} ({abs(spot - sl):.1f} pts)\n"
+       f"1:{R1:g} spot: {r1:.2f} → {BOOK_LOTS} lot book, baaki cost-to-cost\n"
+       f"Target 1:{RR:g} spot: {tgt:.2f}")
 
 
-def exit_pos(st, reason):
+def close_lots(st, lots, reason):
+    """Khuli position ke `lots` lot abhi ke LTP par band."""
     p = st["pos"]
     spot = ltp(SPOT_KEY)
     opt = ltp(p["key"])
-    pnl = (opt - p["opt_entry"]) * p["qty"]
+    pnl = (opt - p["opt_entry"]) * p["lot_size"] * lots
+    p["legs"].append({"lots": lots, "time": now().strftime("%H:%M:%S"),
+                      "spot": round(spot, 2), "opt": round(opt, 2),
+                      "reason": reason, "pnl": round(pnl, 2)})
+    p["lots_open"] -= lots
+    p["booked_pnl"] += pnl
+    save_state(st)
+    return spot, opt, pnl
+
+
+def finish(st):
+    """Position poori band ho gayi: CSV row + Telegram report."""
+    p = st["pos"]
+    legs = p["legs"]
+    total = round(sum(l["pnl"] for l in legs), 2)
     row = {
         "date": st["date"], "trade_no": p["no"], "side": p["side"],
         "entry_time": p["entry_time"], "spot_entry": round(p["spot_entry"], 2),
+        "sl_spot": round(p["sl0"], 2), "target_spot": round(p["tgt"], 2),
         "strike": p["strike"], "expiry": p["expiry"],
         "delta": round(p["delta"], 3), "option_entry": round(p["opt_entry"], 2),
-        "qty": p["qty"], "exit_time": now().strftime("%H:%M:%S"),
-        "spot_exit": round(spot, 2), "option_exit": round(opt, 2),
-        "exit_reason": reason, "pnl": round(pnl, 2),
+        "lots": p["lots_total"], "qty_per_lot": p["lot_size"],
+        "exit_time": legs[-1]["time"], "total_pnl": total,
     }
+    for i in (1, 2):
+        if len(legs) >= i:
+            l = legs[i - 1]
+            row.update({f"leg{i}_lots": l["lots"], f"leg{i}_time": l["time"],
+                        f"leg{i}_spot": l["spot"], f"leg{i}_option": l["opt"],
+                        f"leg{i}_reason": l["reason"], f"leg{i}_pnl": l["pnl"]})
+        else:
+            for c in ("lots", "time", "spot", "option", "reason", "pnl"):
+                row[f"leg{i}_{c}"] = ""
     append_csv(row)
     st["done"].append(row)
     st["pos"] = None
     save_state(st)
-    icon = "✅" if pnl >= 0 else "🔴"
-    tg(f"{icon} NIFTY EXIT #{p['no']} — {p['side']} ({reason})\n"
-       f"Strike: {p['strike']} | Spot: {p['spot_entry']:.2f} → {spot:.2f}\n"
-       f"Premium: {p['opt_entry']:.2f} → {opt:.2f} | Qty: {p['qty']}\n"
-       f"P&L: Rs {pnl:,.2f}")
+    icon = "✅" if total >= 0 else "🔴"
+    lines = [f"{icon} NIFTY EXIT #{p['no']} — {p['side']} {p['strike']} "
+             f"(trade band)",
+             f"Entry: spot {p['spot_entry']:.2f} | premium {p['opt_entry']:.2f} "
+             f"| {p['lots_total']} lot x {p['lot_size']}"]
+    for l in legs:
+        lines.append(f"• {l['lots']} lot {l['reason']} {l['time']}: spot "
+                     f"{l['spot']:.2f}, premium {l['opt']:.2f}, "
+                     f"P&L Rs {l['pnl']:,.2f}")
+    lines.append(f"TOTAL P&L: Rs {total:,.2f}")
+    day_total = sum(r["total_pnl"] for r in st["done"])
+    lines.append(f"Aaj ka total ({len(st['done'])} trade): Rs {day_total:,.2f}")
+    tg("\n".join(lines))
+
+
+def exit_all(st, reason):
+    close_lots(st, st["pos"]["lots_open"], reason)
+    finish(st)
+
+
+def book_partial(st):
+    p = st["pos"]
+    spot, opt, pnl = close_lots(st, BOOK_LOTS, f"1:{R1:g} BOOK")
+    p["stage"] = 1
+    p["sl"] = p["spot_entry"]
+    save_state(st)
+    tg(f"🟡 NIFTY PARTIAL #{p['no']} — {p['side']} {p['strike']}\n"
+       f"{BOOK_LOTS} lot book hua (1:{R1:g}): spot {spot:.2f}, premium "
+       f"{opt:.2f}, P&L Rs {pnl:,.2f}\n"
+       f"Bacha {p['lots_open']} lot: SL ab cost par (spot "
+       f"{p['spot_entry']:.2f}), target {p['tgt']:.2f}")
+
+
+def manage(st):
+    """Khuli position: SL / 1:1 book / target check (spot par)."""
+    p = st["pos"]
+    spot = ltp(SPOT_KEY)
+    long_ = p["side"] == "CE"
+    sl_hit = spot <= p["sl"] if long_ else spot >= p["sl"]
+    r1_hit = spot >= p["r1"] if long_ else spot <= p["r1"]
+    t_hit = spot >= p["tgt"] if long_ else spot <= p["tgt"]
+    if sl_hit:
+        exit_all(st, "SL" if p["stage"] == 0 else "CTC")
+        return
+    if p["stage"] == 0 and r1_hit:
+        book_partial(st)
+    if p["stage"] == 1 and t_hit:
+        exit_all(st, "TARGET")
+
+
+def pnl_update(st, n):
+    """Position khuli ho to har 5 min mein Telegram par PnL."""
+    p = st["pos"]
+    if not p:
+        return
+    b = bnd(n)
+    slot = b.isoformat()
+    if slot <= st.get("last_pnl_slot", "") or (n - b).total_seconds() < 5:
+        return
+    if b.minute % PNL_UPDATE_MINUTES:
+        return
+    spot = ltp(SPOT_KEY)
+    opt = ltp(p["key"])
+    open_pnl = (opt - p["opt_entry"]) * p["lot_size"] * p["lots_open"]
+    total = p["booked_pnl"] + open_pnl
+    st["last_pnl_slot"] = slot
+    save_state(st)
+    icon = "📈" if total >= 0 else "📉"
+    tg(f"{icon} NIFTY PNL {n.strftime('%H:%M')} — #{p['no']} {p['side']} "
+       f"{p['strike']}\n"
+       f"Spot {spot:.2f} (entry {p['spot_entry']:.2f}) | Premium {opt:.2f} "
+       f"(entry {p['opt_entry']:.2f})\n"
+       f"Khule lot: {p['lots_open']}/{p['lots_total']} | SL {p['sl']:.2f} | "
+       f"Target {p['tgt']:.2f}\n"
+       f"Open P&L: Rs {open_pnl:,.2f} | Booked: Rs {p['booked_pnl']:,.2f}\n"
+       f"Trade total: Rs {total:,.2f}")
+
+
+def handle_signal(st, sig, cs, ts):
+    p = st["pos"]
+    if p:
+        if p["side"] == sig:
+            return
+        tg(f"🔄 NIFTY: {sig} crossover aaya, chalti {p['side']} trade band "
+           f"karke nayi trade lunga")
+        exit_all(st, "REVERSAL")
+    if st["trades"] >= MAX_TRADES:
+        tg(f"nifty: {sig} signal aaya par aaj ke {MAX_TRADES} trade ho chuke, "
+           f"nayi trade nahi.")
+        return
+    enter(st, sig, cs, ts)
 
 
 def day_summary(st):
     done = st["done"]
-    total = sum(r["pnl"] for r in done)
-    wins = sum(1 for r in done if r["pnl"] > 0)
+    total = sum(r["total_pnl"] for r in done)
+    wins = sum(1 for r in done if r["total_pnl"] > 0)
     tg(f"📊 NIFTY DAY SUMMARY {st['date']}\n"
        f"Trades: {len(done)} | Win: {wins} | Loss: {len(done) - wins}\n"
        f"Total P&L: Rs {total:,.2f}")
@@ -351,7 +497,9 @@ def run_live():
 
     tg(f"🚀 NIFTY LIVE (paper) shuru\n"
        f"EMA {FAST_EMA}/{SLOW_EMA} | 5 min | delta {TARGET_DELTA} | "
-       f"SL pichhli {SL_CANDLES} candle H/L / Target 1:{RR:g} (spot)\n"
+       f"{LOTS} lot\n"
+       f"SL pichhli {SL_CANDLES} candle H/L | 1:{R1:g} par {BOOK_LOTS} lot "
+       f"book, baaki CTC | Target 1:{RR:g} (spot)\n"
        f"Aaj ke trades ab tak: {st['trades']}/{MAX_TRADES}"
        + (" | position khuli hai" if st["pos"] else ""))
 
@@ -361,7 +509,7 @@ def run_live():
             n = now()
             if n >= end:
                 if st["pos"]:
-                    exit_pos(st, "TIME 15:15")
+                    exit_all(st, "TIME 15:15")
                 break
             try:
                 # holiday check (ek baar, 9:40 ke baad)
@@ -374,34 +522,23 @@ def run_live():
                     st["holiday_checked"] = True
                     save_state(st)
 
+                # 1) khuli position: SL / 1:1 / target
                 if st["pos"]:
-                    p = st["pos"]
-                    spot = ltp(SPOT_KEY)
-                    if p["side"] == "CE":
-                        hit_sl, hit_t = spot <= p["sl"], spot >= p["tgt"]
-                    else:
-                        hit_sl, hit_t = spot >= p["sl"], spot <= p["tgt"]
-                    if hit_sl:
-                        exit_pos(st, "SL")
-                    elif hit_t:
-                        exit_pos(st, "TARGET")
-                    errors = 0
-                    time.sleep(POLL_SECONDS)
-                    # position ke dauran candle boundary bhi mark hoti rahe
-                    # (neeche wala hissa chalega)
+                    manage(st)
+                # 2) har 5 min PnL update
+                if st["pos"]:
+                    pnl_update(st, n)
 
-                boundary = n.replace(minute=n.minute // 5 * 5, second=0,
-                                     microsecond=0)
-                last_start = boundary - dt.timedelta(minutes=5)
+                # 3) naya candle close hua? crossover dekho
+                b = bnd(n)
+                last_start = b - dt.timedelta(minutes=5)
                 key = last_start.isoformat()
-                age = (n - boundary).total_seconds()
+                age = (n - b).total_seconds()
 
                 if key > st["last_candle"] and age >= 4:
-                    tradable = (
-                        not st["pos"] and st["trades"] < MAX_TRADES
-                        and at(today, WINDOW_START) <= last_start
-                        <= at(today, LAST_CANDLE_START))
-                    if age > 90 or not tradable:
+                    in_win = (at(today, WINDOW_START) <= last_start
+                              <= at(today, LAST_CANDLE_START))
+                    if age > 90 or not in_win:
                         st["last_candle"] = key
                         save_state(st)
                     else:
@@ -419,16 +556,17 @@ def run_live():
                             log("candle", last_start.strftime("%H:%M"),
                                 "signal:", sig)
                             if sig:
-                                enter(st, sig, cs, last_start)
+                                handle_signal(st, sig, cs, last_start)
                 errors = 0
             except Exception as e:
                 errors += 1
                 log("loop error:", e)
                 if errors == 10:
                     tg(f"⚠️ nifty: baar baar error aa raha hai: {str(e)[:150]}")
-            if not st["pos"]:
-                nxt = (n.replace(minute=n.minute // 5 * 5, second=4,
-                                 microsecond=0) + dt.timedelta(minutes=5))
+            if st["pos"]:
+                time.sleep(POLL_SECONDS)
+            else:
+                nxt = (bnd(n).replace(second=4) + dt.timedelta(minutes=5))
                 time.sleep(max(1, min(20, (nxt - now()).total_seconds())))
     finally:
         save_state(st)
@@ -442,62 +580,75 @@ def run_live():
 
 # ------------------------------ test mode ------------------------------
 def simulate_day(candles, day):
-    """Spot par replay: cross -> entry at close, SL/target high-low se."""
+    """Spot par replay (naye rules): cross -> entry at close, SL pichhli candle,
+    1:1 par BOOK_LOTS book, baaki CTC, target 1:RR, ulta cross = reversal.
+    pts = sab lot ke points ka jod (har lot ke liye alag gina)."""
     closes = [c["c"] for c in candles]
     ef = ema_series(closes, FAST_EMA)
     es = ema_series(closes, SLOW_EMA)
     idx = [i for i, c in enumerate(candles) if c["ts"].date() == day]
-    results = []
-    i = 0
-    while i < len(idx) and len(results) < MAX_TRADES:
-        k = idx[i]
+    out = []
+    state = {"pos": None, "count": 0}
+
+    def pts(side, entry, px):
+        return (px - entry) if side == "CE" else (entry - px)
+
+    def close(px, why, lots):
+        p = state["pos"]
+        p["pts"] += pts(p["side"], p["entry"], px) * lots
+        p["legs"].append(f"{lots}L {why}@{px:.1f}")
+        p["open"] -= lots
+        if p["open"] <= 0:
+            out.append({"side": p["side"], "t": p["t"], "entry": p["entry"],
+                        "legs": " | ".join(p["legs"]), "pts": p["pts"]})
+            state["pos"] = None
+
+    for k in idx:
         c = candles[k]
-        ok = (at(day, WINDOW_START) <= c["ts"] <= at(day, LAST_CANDLE_START))
-        side = cross_at(ef, es, k) if ok else None
-        if not side:
-            i += 1
-            continue
-        entry = c["c"]
-        lv = levels(side, entry, candles, k)
-        if not lv:
-            i += 1
-            continue
-        sl, tgt = lv
-        exit_px, reason, j = None, None, i + 1
-        while j < len(idx):
-            d = candles[idx[j]]
-            if side == "CE":
-                if d["l"] <= sl:
-                    exit_px, reason = sl, "SL"
-                elif d["h"] >= tgt:
-                    exit_px, reason = tgt, "TARGET"
+        p = state["pos"]
+        if p:
+            long_ = p["side"] == "CE"
+            sl_hit = c["l"] <= p["sl"] if long_ else c["h"] >= p["sl"]
+            r1_hit = c["h"] >= p["r1"] if long_ else c["l"] <= p["r1"]
+            t_hit = c["h"] >= p["tgt"] if long_ else c["l"] <= p["tgt"]
+            if sl_hit:
+                close(p["sl"], "SL" if p["stage"] == 0 else "CTC", p["open"])
             else:
-                if d["h"] >= sl:
-                    exit_px, reason = sl, "SL"
-                elif d["l"] <= tgt:
-                    exit_px, reason = tgt, "TARGET"
-            if reason:
-                break
-            if d["ts"] >= at(day, LAST_CANDLE_START):
-                exit_px, reason = d["c"], "TIME"
-                break
-            j += 1
-        if reason is None:
-            last = candles[idx[-1]]
-            exit_px, reason, j = last["c"], "TIME(open)", len(idx) - 1
-        pts = (exit_px - entry) if side == "CE" else (entry - exit_px)
-        results.append({"side": side, "t": c["ts"].strftime("%H:%M"),
-                        "entry": entry, "exit": exit_px, "why": reason,
-                        "pts": pts})
-        i = max(j, i + 1)
-    return results
+                if p["stage"] == 0 and r1_hit:
+                    close(p["r1"], "1:1", BOOK_LOTS)
+                    p["stage"] = 1
+                    p["sl"] = p["entry"]
+                if state["pos"] and p["stage"] == 1 and t_hit:
+                    close(p["tgt"], "TARGET", p["open"])
+
+        in_win = (at(day, WINDOW_START) <= c["ts"] <= at(day, LAST_CANDLE_START))
+        sig = cross_at(ef, es, k) if in_win else None
+        if sig:
+            p = state["pos"]
+            if p and p["side"] != sig:
+                close(c["c"], "REVERSAL", p["open"])
+            if not state["pos"] and state["count"] < MAX_TRADES:
+                lv = levels(sig, c["c"], candles, k)
+                if lv:
+                    state["count"] += 1
+                    state["pos"] = {
+                        "side": sig, "entry": c["c"], "sl": lv[0], "r1": lv[1],
+                        "tgt": lv[2], "stage": 0, "open": LOTS, "pts": 0.0,
+                        "legs": [], "t": c["ts"].strftime("%H:%M")}
+        p = state["pos"]
+        if p and c["ts"] >= at(day, LAST_CANDLE_START):
+            close(c["c"], "TIME", p["open"])
+    if state["pos"]:
+        close(candles[idx[-1]]["c"], "TIME(open)", state["pos"]["open"])
+    return out
 
 
 def run_test():
     L = ["🧪 NIFTY TEST (mode 1) — koi trade/CSV save nahi hoga",
          f"Time: {now().strftime('%d-%b %H:%M')}"]
     L.append(f"Settings: EMA {FAST_EMA}/{SLOW_EMA}, delta {TARGET_DELTA}, "
-             f"SL pichhli {SL_CANDLES} candle H/L, target 1:{RR:g}, "
+             f"{LOTS} lot, SL pichhli {SL_CANDLES} candle H/L, "
+             f"1:{R1:g} par {BOOK_LOTS} lot book + CTC, target 1:{RR:g}, "
              f"max {MAX_TRADES} trades")
 
     try:
@@ -528,12 +679,12 @@ def run_test():
             L.append(f"✅ Candles OK ({len(cs)}), replay din: {day}")
             res = simulate_day(cs, day)
             if not res:
-                L.append("Replay: us din koi cross nahi (window 9:20-15:15)")
+                L.append("Replay: us din koi trade nahi (window 9:20-15:15)")
             for r in res:
                 L.append(f"• {r['t']} {r['side']} entry {r['entry']:.1f} → "
-                         f"{r['exit']:.1f} ({r['why']}) = {r['pts']:+.1f} pts")
+                         f"{r['legs']} = {r['pts']:+.1f} pts")
             if res:
-                L.append(f"Replay total (spot pts): "
+                L.append(f"Replay total ({LOTS} lot ke pts ka jod, spot par): "
                          f"{sum(r['pts'] for r in res):+.1f}")
     except Exception as e:
         L.append(f"❌ Candle error: {str(e)[:120]}")
