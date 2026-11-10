@@ -8,10 +8,13 @@ Usage:  python nifty_algo.py 0   -> LIVE (paper) : follows market window 09:20-1
                                                    to Telegram. No state / CSV saved.
 
 Rules:
-- Pehla crossover (upar = CE buy, niche = PE buy) -> trade, entry crossover candle close par.
+- ENTRY: 5 min candle close par crossover (upar = CE buy, niche = PE buy).
 - SL = entry candle se pehle ki candle ka low (CE) / high (PE)  [spot par].
 - 1:1 par 1 lot book, bacha lot cost-to-cost (SL = entry spot), target 1:2 (spot par).
-- SL / target ke pehle ulta crossover aaye to chalti trade band + nayi trade.
+- EXIT (SL / 1:1 / target): spot price touch hote hi, candle close ka wait nahi.
+  Us waqt option ke live price par market-order jaisa paper exit.
+- SL / target se pehle ulta crossover aaye to chalti trade band + nayi trade.
+- Live price: Upstox websocket (tick by tick). Na chale to REST (har ~2 sec).
 """
 import os
 import sys
@@ -41,7 +44,9 @@ WINDOW_END = "15:15"      # sab position force close
 LAST_CANDLE_START = "15:10"   # ye candle 15:15 par close hota hai (last entry)
 MAX_TRADES = 2            # poore din mein total (CE + PE)
 DEFAULT_LOT_SIZE = 65     # sirf tab use hoga jab Upstox lot size na de
-POLL_SECONDS = 15         # position khuli ho to spot kitne second mein check hoga
+TICK_SECONDS = 0.2        # position khuli ho to trigger kitni jaldi check hoga
+STALE_SECONDS = 5         # websocket tick itna purana ho to REST se price lo
+REST_FALLBACK_SECONDS = 2 # REST fallback mein kitne second mein ek baar price
 PNL_UPDATE_MINUTES = 5    # position khuli ho to har itne minute mein Telegram PnL
 # ========================================================================
 
@@ -51,6 +56,7 @@ SPOT_KEY = "NSE_INDEX|Nifty 50"
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(HERE, "state.json")
 CSV_FILE = os.path.join(HERE, "trades.csv")
+PNL_LOG_FILE = os.path.join(HERE, "pnl_log.csv")
 
 TOKEN = os.environ.get("UPSTOX_TOKEN", "")
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -64,6 +70,12 @@ CSV_COLS = ["date", "trade_no", "side", "entry_time", "spot_entry", "sl_spot",
             "leg2_lots", "leg2_time", "leg2_spot", "leg2_option", "leg2_reason",
             "leg2_pnl",
             "exit_time", "total_pnl"]
+
+PNL_COLS = ["date", "time", "trade_no", "side", "strike", "spot", "option_cmp",
+            "option_entry", "pts_diff", "lots_open", "qty_open", "live_pnl",
+            "booked_pnl", "total_pnl"]
+
+FEED = None   # run_live / run_test mein set hota hai
 
 
 # ------------------------------ helpers ------------------------------
@@ -192,6 +204,17 @@ def ltp(key):
     return float(list(data.values())[0]["last_price"])
 
 
+def ltp_multi(keys):
+    """Ek hi REST call mein kai instrument ka price: {key: price}."""
+    data = api("/v2/market-quote/ltp", {"instrument_key": ",".join(keys)})
+    out = {}
+    for v in (data or {}).values():
+        tok = v.get("instrument_token")
+        if tok and v.get("last_price") is not None:
+            out[tok] = float(v["last_price"])
+    return out
+
+
 def contract_info():
     data = api("/v2/option/contract", {"instrument_key": SPOT_KEY})
     today = str(now().date())
@@ -227,10 +250,130 @@ def pick_strike(side, expiry):
     return best
 
 
+# ------------------------------ live price feed ------------------------------
+class Feed:
+    """Live price. Pehle Upstox websocket (tick by tick). Tick na aaye ya
+    websocket na chale to REST se (har REST_FALLBACK_SECONDS mein ek baar)."""
+
+    def __init__(self):
+        self.px = {}            # key -> (price, epoch)
+        self.keys = set()
+        self.streamer = None
+        self.ws_ok = False      # kabhi websocket tick aaya?
+        self.last_rest = 0.0
+
+    # ---- websocket ----
+    def _find(self, obj):
+        """Message ke andar se ltpc.ltp dhundo (ltpc / full dono mode chalenge)."""
+        if isinstance(obj, dict):
+            lt = obj.get("ltpc")
+            if isinstance(lt, dict) and lt.get("ltp") is not None:
+                try:
+                    v = float(lt["ltp"])
+                    if v > 0:
+                        return v
+                except Exception:
+                    pass
+            for v in obj.values():
+                r = self._find(v)
+                if r is not None:
+                    return r
+        return None
+
+    def _on_message(self, msg):
+        try:
+            if isinstance(msg, (str, bytes)):
+                msg = json.loads(msg)
+            feeds = (msg or {}).get("feeds") or {}
+            t = time.time()
+            for key, val in feeds.items():
+                p = self._find(val)
+                if p:
+                    self.px[key] = (p, t)
+                    self.ws_ok = True
+        except Exception as e:
+            log("ws message error:", type(e).__name__)
+
+    def _on_open(self, *a):
+        try:
+            self.streamer.subscribe(sorted(self.keys), "ltpc")
+        except Exception as e:
+            log("ws subscribe error:", str(e)[:100])
+
+    def start(self, keys):
+        self.keys = set(keys)
+        try:
+            import upstox_client
+        except Exception:
+            log("upstox SDK install nahi -> REST fallback")
+            return False
+        try:
+            cfg = upstox_client.Configuration()
+            cfg.access_token = TOKEN
+            s = upstox_client.MarketDataStreamerV3(upstox_client.ApiClient(cfg))
+            try:
+                s.auto_reconnect(True, 5, 200)
+            except Exception:
+                pass
+            s.on("open", self._on_open)
+            s.on("message", self._on_message)
+            s.on("error", lambda *a: log("ws error:", str(a)[:120]))
+            s.on("close", lambda *a: log("ws close"))
+            self.streamer = s
+            s.connect()
+            return True
+        except Exception as e:
+            log("websocket start fail:", str(e)[:120])
+            return False
+
+    def subscribe(self, key):
+        self.keys.add(key)
+        if self.streamer:
+            try:
+                self.streamer.subscribe([key], "ltpc")
+            except Exception as e:
+                log("ws subscribe error:", str(e)[:100])
+
+    def unsubscribe(self, key):
+        self.keys.discard(key)
+        if self.streamer:
+            try:
+                self.streamer.unsubscribe([key])
+            except Exception:
+                pass
+
+    def stop(self):
+        if self.streamer:
+            try:
+                self.streamer.disconnect()
+            except Exception:
+                pass
+
+    # ---- price ----
+    def price(self, key, urgent=False):
+        """Taaza price. Websocket tick taaza ho to wahi. Warna REST (throttled);
+        urgent=True (exit ke waqt) mein throttle nahi."""
+        t = time.time()
+        v = self.px.get(key)
+        if v and t - v[1] <= STALE_SECONDS:
+            return v[0]
+        if urgent or t - self.last_rest >= REST_FALLBACK_SECONDS:
+            self.last_rest = t
+            try:
+                got = ltp_multi(sorted(self.keys | {key}))
+                for k, p in got.items():
+                    self.px[k] = (p, t)
+            except Exception as e:
+                log("rest price error:", str(e)[:100])
+        v = self.px.get(key)
+        return v[0] if v else None
+
+
 # ------------------------------ state / csv ------------------------------
 def fresh_state(day):
     return {"date": str(day), "trades": 0, "last_candle": "", "pos": None,
-            "done": [], "holiday_checked": False, "last_pnl_slot": ""}
+            "done": [], "holiday_checked": False, "last_pnl_slot": "",
+            "last_min_slot": ""}
 
 
 def load_state(day):
@@ -239,6 +382,7 @@ def load_state(day):
             st = json.load(f)
         if st.get("date") == str(day):
             st.setdefault("last_pnl_slot", "")
+            st.setdefault("last_min_slot", "")
             return st
     except Exception:
         pass
@@ -264,6 +408,15 @@ def append_csv(row):
     new = not os.path.exists(CSV_FILE)
     with open(CSV_FILE, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CSV_COLS)
+        if new:
+            w.writeheader()
+        w.writerow(row)
+
+
+def append_pnl_log(row):
+    new = not os.path.exists(PNL_LOG_FILE)
+    with open(PNL_LOG_FILE, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=PNL_COLS)
         if new:
             w.writeheader()
         w.writerow(row)
@@ -317,6 +470,7 @@ def enter(st, side, cs, ts):
     }
     st["last_pnl_slot"] = bnd(now()).isoformat()
     save_state(st)
+    FEED.subscribe(pick["key"])
     p = st["pos"]
     tg(f"🟢 NIFTY ENTRY #{p['no']} — {side} BUY ({LOTS} lot)\n"
        f"Candle: {ts.strftime('%H:%M')} close, EMA {FAST_EMA}/{SLOW_EMA} "
@@ -327,14 +481,18 @@ def enter(st, side, cs, ts):
        f"Premium entry: {p['opt_entry']:.2f} | Qty: {p['lot_size'] * LOTS}\n"
        f"SL spot: {sl:.2f} ({abs(spot - sl):.1f} pts)\n"
        f"1:{R1:g} spot: {r1:.2f} → {BOOK_LOTS} lot book, baaki cost-to-cost\n"
-       f"Target 1:{RR:g} spot: {tgt:.2f}")
+       f"Target 1:{RR:g} spot: {tgt:.2f}\n"
+       f"(SL/target spot touch hote hi turant exit)")
 
 
-def close_lots(st, lots, reason):
-    """Khuli position ke `lots` lot abhi ke LTP par band."""
+def close_lots(st, lots, reason, spot=None):
+    """Khuli position ke `lots` lot abhi ke live price par band (market order)."""
     p = st["pos"]
-    spot = ltp(SPOT_KEY)
-    opt = ltp(p["key"])
+    if spot is None:
+        spot = FEED.price(SPOT_KEY, urgent=True)
+    opt = FEED.price(p["key"], urgent=True)
+    if spot is None or opt is None:
+        raise RuntimeError("live price nahi mila (exit retry hoga)")
     pnl = (opt - p["opt_entry"]) * p["lot_size"] * lots
     p["legs"].append({"lots": lots, "time": now().strftime("%H:%M:%S"),
                       "spot": round(spot, 2), "opt": round(opt, 2),
@@ -372,6 +530,7 @@ def finish(st):
     st["done"].append(row)
     st["pos"] = None
     save_state(st)
+    FEED.unsubscribe(p["key"])
     icon = "✅" if total >= 0 else "🔴"
     lines = [f"{icon} NIFTY EXIT #{p['no']} — {p['side']} {p['strike']} "
              f"(trade band)",
@@ -387,43 +546,54 @@ def finish(st):
     tg("\n".join(lines))
 
 
-def exit_all(st, reason):
-    close_lots(st, st["pos"]["lots_open"], reason)
+def exit_all(st, reason, spot=None):
+    close_lots(st, st["pos"]["lots_open"], reason, spot)
     finish(st)
 
 
-def book_partial(st):
+def book_partial(st, spot):
     p = st["pos"]
-    spot, opt, pnl = close_lots(st, BOOK_LOTS, f"1:{R1:g} BOOK")
+    spot, opt, pnl = close_lots(st, BOOK_LOTS, f"1:{R1:g} BOOK", spot)
     p["stage"] = 1
     p["sl"] = p["spot_entry"]
     save_state(st)
-    tg(f"🟡 NIFTY PARTIAL #{p['no']} — {p['side']} {p['strike']}\n"
-       f"{BOOK_LOTS} lot book hua (1:{R1:g}): spot {spot:.2f}, premium "
-       f"{opt:.2f}, P&L Rs {pnl:,.2f}\n"
-       f"Bacha {p['lots_open']} lot: SL ab cost par (spot "
-       f"{p['spot_entry']:.2f}), target {p['tgt']:.2f}")
+    live = (opt - p["opt_entry"]) * p["lot_size"] * p["lots_open"]
+    tg(f"🟡 NIFTY #{p['no']} {p['side']} {p['strike']} — "
+       f"1:{R1:g} TRADE CLOSE ({BOOK_LOTS} lot)\n"
+       f"Booked PNL: Rs {p['booked_pnl']:,.2f}\n"
+       f"Live PNL: Rs {live:,.2f}")
 
 
 def manage(st):
-    """Khuli position: SL / 1:1 book / target check (spot par)."""
+    """Khuli position: SL / 1:1 book / target. Spot price touch hote hi turant
+    (candle close ka wait nahi)."""
     p = st["pos"]
-    spot = ltp(SPOT_KEY)
+    spot = FEED.price(SPOT_KEY)
+    if spot is None:
+        return
     long_ = p["side"] == "CE"
     sl_hit = spot <= p["sl"] if long_ else spot >= p["sl"]
     r1_hit = spot >= p["r1"] if long_ else spot <= p["r1"]
     t_hit = spot >= p["tgt"] if long_ else spot <= p["tgt"]
     if sl_hit:
-        exit_all(st, "SL" if p["stage"] == 0 else "CTC")
+        exit_all(st, "SL" if p["stage"] == 0 else "CTC", spot)
         return
     if p["stage"] == 0 and r1_hit:
-        book_partial(st)
+        book_partial(st, spot)
     if p["stage"] == 1 and t_hit:
-        exit_all(st, "TARGET")
+        exit_all(st, "TARGET", spot)
+
+
+def live_numbers(p, opt):
+    """Option points diff (CMP - entry), khule lot ka live PNL, total."""
+    qty = p["lot_size"] * p["lots_open"]
+    diff = opt - p["opt_entry"]
+    live = diff * qty
+    return diff, qty, live, p["booked_pnl"] + live
 
 
 def pnl_update(st, n):
-    """Position khuli ho to har 5 min mein Telegram par PnL."""
+    """Position khuli ho to har 5 min mein Telegram par live PNL."""
     p = st["pos"]
     if not p:
         return
@@ -433,21 +603,50 @@ def pnl_update(st, n):
         return
     if b.minute % PNL_UPDATE_MINUTES:
         return
-    spot = ltp(SPOT_KEY)
-    opt = ltp(p["key"])
-    open_pnl = (opt - p["opt_entry"]) * p["lot_size"] * p["lots_open"]
-    total = p["booked_pnl"] + open_pnl
+    spot = FEED.price(SPOT_KEY)
+    opt = FEED.price(p["key"])
+    if spot is None or opt is None:
+        return
+    diff, qty, live, total = live_numbers(p, opt)
     st["last_pnl_slot"] = slot
     save_state(st)
     icon = "📈" if total >= 0 else "📉"
-    tg(f"{icon} NIFTY PNL {n.strftime('%H:%M')} — #{p['no']} {p['side']} "
+    tg(f"{icon} NIFTY LIVE PNL {n.strftime('%H:%M')} — #{p['no']} {p['side']} "
        f"{p['strike']}\n"
-       f"Spot {spot:.2f} (entry {p['spot_entry']:.2f}) | Premium {opt:.2f} "
-       f"(entry {p['opt_entry']:.2f})\n"
-       f"Khule lot: {p['lots_open']}/{p['lots_total']} | SL {p['sl']:.2f} | "
-       f"Target {p['tgt']:.2f}\n"
-       f"Open P&L: Rs {open_pnl:,.2f} | Booked: Rs {p['booked_pnl']:,.2f}\n"
-       f"Trade total: Rs {total:,.2f}")
+       f"Entry {p['opt_entry']:.2f} | CMP {opt:.2f} | Diff {diff:+.2f} pts\n"
+       f"Khule lot {p['lots_open']}/{p['lots_total']}: {diff:+.2f} x {qty} = "
+       f"Live PNL Rs {live:,.2f}\n"
+       f"Booked PNL: Rs {p['booked_pnl']:,.2f}\n"
+       f"Total: Rs {total:,.2f}\n"
+       f"Spot {spot:.2f} | SL {p['sl']:.2f} | Target {p['tgt']:.2f}")
+
+
+def minute_log(st, n):
+    """Position khuli ho to har 1 min mein option PNL: log + pnl_log.csv."""
+    p = st["pos"]
+    if not p:
+        return
+    slot = n.replace(second=0, microsecond=0).isoformat()
+    if slot <= st.get("last_min_slot", ""):
+        return
+    spot = FEED.price(SPOT_KEY)
+    opt = FEED.price(p["key"])
+    if spot is None or opt is None:
+        return
+    diff, qty, live, total = live_numbers(p, opt)
+    st["last_min_slot"] = slot
+    row = {"date": st["date"], "time": n.strftime("%H:%M"),
+           "trade_no": p["no"], "side": p["side"], "strike": p["strike"],
+           "spot": round(spot, 2), "option_cmp": round(opt, 2),
+           "option_entry": round(p["opt_entry"], 2),
+           "pts_diff": round(diff, 2), "lots_open": p["lots_open"],
+           "qty_open": qty, "live_pnl": round(live, 2),
+           "booked_pnl": round(p["booked_pnl"], 2),
+           "total_pnl": round(total, 2)}
+    append_pnl_log(row)
+    log(f"PNL1m #{p['no']} {p['side']} {p['strike']} spot {spot:.2f} "
+        f"opt {opt:.2f} diff {diff:+.2f} x {qty} live {live:,.2f} "
+        f"booked {p['booked_pnl']:,.2f} total {total:,.2f}")
 
 
 def handle_signal(st, sig, cs, ts):
@@ -475,6 +674,7 @@ def day_summary(st):
 
 
 def run_live():
+    global FEED
     t = now()
     today = t.date()
     if today.weekday() >= 5:
@@ -495,15 +695,28 @@ def run_live():
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
 
+    FEED = Feed()
+    keys = [SPOT_KEY] + ([st["pos"]["key"]] if st["pos"] else [])
+    FEED.start(keys)
+    for _ in range(40):                      # max ~8 sec websocket tick ka wait
+        if FEED.ws_ok:
+            break
+        time.sleep(0.2)
+    feed_txt = ("websocket (tick by tick) ✅" if FEED.ws_ok else
+                f"REST fallback (har ~{REST_FALLBACK_SECONDS} sec) ⚠️")
+
     tg(f"🚀 NIFTY LIVE (paper) shuru\n"
        f"EMA {FAST_EMA}/{SLOW_EMA} | 5 min | delta {TARGET_DELTA} | "
        f"{LOTS} lot\n"
        f"SL pichhli {SL_CANDLES} candle H/L | 1:{R1:g} par {BOOK_LOTS} lot "
        f"book, baaki CTC | Target 1:{RR:g} (spot)\n"
+       f"Entry candle close par, SL/target touch par turant exit\n"
+       f"Price feed: {feed_txt}\n"
        f"Aaj ke trades ab tak: {st['trades']}/{MAX_TRADES}"
        + (" | position khuli hai" if st["pos"] else ""))
 
     errors = 0
+    next_try = 0.0
     try:
         while not stop["flag"]:
             n = now()
@@ -522,12 +735,13 @@ def run_live():
                     st["holiday_checked"] = True
                     save_state(st)
 
-                # 1) khuli position: SL / 1:1 / target
+                # 1) khuli position: SL / 1:1 / target (tick par)
                 if st["pos"]:
                     manage(st)
-                # 2) har 5 min PnL update
+                # 2) har 5 min Telegram PnL + har 1 min log
                 if st["pos"]:
                     pnl_update(st, n)
+                    minute_log(st, n)
 
                 # 3) naya candle close hua? crossover dekho
                 b = bnd(n)
@@ -535,7 +749,8 @@ def run_live():
                 key = last_start.isoformat()
                 age = (n - b).total_seconds()
 
-                if key > st["last_candle"] and age >= 4:
+                if (key > st["last_candle"] and age >= 4
+                        and time.time() >= next_try):
                     in_win = (at(today, WINDOW_START) <= last_start
                               <= at(today, LAST_CANDLE_START))
                     if age > 90 or not in_win:
@@ -545,16 +760,16 @@ def run_live():
                         cs = get_candles()
                         if not cs or cs[-1]["ts"] < last_start:
                             if age < 60:
-                                time.sleep(3)
-                                continue
-                            st["last_candle"] = key
-                            save_state(st)
+                                next_try = time.time() + 3   # thodi der baad retry
+                            else:
+                                st["last_candle"] = key
+                                save_state(st)
                         else:
                             st["last_candle"] = key
                             save_state(st)
                             sig = latest_signal(cs)
                             log("candle", last_start.strftime("%H:%M"),
-                                "signal:", sig)
+                                "crossover:", sig or "koi nahi")
                             if sig:
                                 handle_signal(st, sig, cs, last_start)
                 errors = 0
@@ -563,13 +778,15 @@ def run_live():
                 log("loop error:", e)
                 if errors == 10:
                     tg(f"⚠️ nifty: baar baar error aa raha hai: {str(e)[:150]}")
+                time.sleep(1)
             if st["pos"]:
-                time.sleep(POLL_SECONDS)
+                time.sleep(TICK_SECONDS)
             else:
                 nxt = (bnd(n).replace(second=4) + dt.timedelta(minutes=5))
                 time.sleep(max(1, min(20, (nxt - now()).total_seconds())))
     finally:
         save_state(st)
+        FEED.stop()
         if stop["flag"]:
             tg("⛔ nifty run beech mein ruk gaya"
                + (" — POSITION KHULI HAI, jaldi dobara run karo (mode 0)."
@@ -655,6 +872,35 @@ def run_test():
         L.append(f"✅ Upstox token OK | Nifty spot: {ltp(SPOT_KEY):.2f}")
     except Exception as e:
         L.append(f"❌ Upstox token/spot error: {str(e)[:120]}")
+
+    # live price feed check (websocket)
+    f = Feed()
+    try:
+        try:
+            import upstox_client  # noqa: F401
+            have_sdk = True
+        except Exception:
+            have_sdk = False
+        if not have_sdk:
+            L.append("⚠️ Live feed: upstox SDK install nahi hui (workflow mein "
+                     "'pip install requests upstox-python-sdk' chahiye). "
+                     "Abhi REST fallback chalega.")
+        else:
+            f.start([SPOT_KEY])
+            for _ in range(60):          # max ~12 sec
+                if f.ws_ok:
+                    break
+                time.sleep(0.2)
+            if f.ws_ok:
+                L.append(f"✅ Live feed (websocket) chal raha hai | spot tick: "
+                         f"{f.px[SPOT_KEY][0]:.2f}")
+            else:
+                L.append("⚠️ Websocket se tick nahi aaya (market band ho to "
+                         "normal ho sakta hai). Tab REST fallback chalega.")
+    except Exception as e:
+        L.append(f"⚠️ Live feed check error: {str(e)[:100]}")
+    finally:
+        f.stop()
 
     try:
         info = contract_info()
