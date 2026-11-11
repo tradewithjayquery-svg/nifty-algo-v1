@@ -1,2 +1,3 @@
 date,trade_no,side,entry_time,spot_entry,sl_spot,target_spot,strike,expiry,delta,option_entry,lots,qty_per_lot,leg1_lots,leg1_time,leg1_spot,leg1_option,leg1_reason,leg1_pnl,leg2_lots,leg2_time,leg2_spot,leg2_option,leg2_reason,leg2_pnl,exit_time,total_pnl
 2026-11-09,1,PE,09:35:05,24965.65,24977.45,24942.05,25050.0,2026-11-09,-0.671,168.8,2,65,1,09:35:21,24929.45,174.4,1:1 BOOK,364.0,1,09:35:23,24929.95,173.25,TARGET,289.25,09:35:23,653.25
+2026-11-11,1,PE,12:30:05,25310.35,25345.9,25239.25,25650.0,2026-11-17,-0.701,429.75,2,65,1,12:39:28,25274.55,450.2,1:1 BOOK,1329.25,1,12:50:00,25310.95,427.25,CTC,-162.5,12:50:00,1166.75
