@@ -1,40 +1,10 @@
 {
- "date": "2026-11-19",
- "trades": 1,
- "last_candle": "2026-11-19T15:00:00+05:30",
+ "date": "2026-11-20",
+ "trades": 0,
+ "last_candle": "2026-11-20T14:40:00+05:30",
  "pos": null,
- "done": [
-  {
-   "date": "2026-11-19",
-   "trade_no": 1,
-   "side": "CE",
-   "entry_time": "09:55:05",
-   "spot_entry": 25246.7,
-   "sl_spot": 25224.95,
-   "target_spot": 25290.2,
-   "strike": 25050.0,
-   "expiry": "2026-11-23",
-   "delta": 0.705,
-   "option_entry": 272.45,
-   "lots": 2,
-   "qty_per_lot": 65,
-   "exit_time": "10:00:35",
-   "total_pnl": 2034.5,
-   "leg1_lots": 1,
-   "leg1_time": "09:58:00",
-   "leg1_spot": 25268.75,
-   "leg1_option": 281.2,
-   "leg1_reason": "1:1 BOOK",
-   "leg1_pnl": 568.75,
-   "leg2_lots": 1,
-   "leg2_time": "10:00:35",
-   "leg2_spot": 25290.3,
-   "leg2_option": 295.0,
-   "leg2_reason": "TARGET",
-   "leg2_pnl": 1465.75
-  }
- ],
+ "done": [],
  "holiday_checked": true,
- "last_pnl_slot": "2026-11-19T10:00:00+05:30",
- "last_min_slot": "2026-11-19T10:00:00+05:30"
+ "last_pnl_slot": "",
+ "last_min_slot": ""
 }
