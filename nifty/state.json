@@ -1,39 +1,40 @@
 {
- "date": "2026-11-23",
+ "date": "2026-11-25",
  "trades": 1,
- "last_candle": "2026-11-23T14:50:00+05:30",
- "pos": {
-  "no": 1,
-  "side": "PE",
-  "strike": 25750.0,
-  "key": "NSE_FO|64488",
-  "expiry": "2026-11-23",
-  "delta": -0.7111,
-  "lot_size": 65,
-  "lots_total": 2,
-  "lots_open": 1,
-  "spot_entry": 25624.45,
-  "sl0": 25786.95,
-  "sl": 25624.45,
-  "r1": 25461.95,
-  "tgt": 25299.45,
-  "stage": 1,
-  "opt_entry": 224.85,
-  "entry_time": "09:35:04",
-  "legs": [
-   {
-    "lots": 1,
-    "time": "13:10:38",
-    "spot": 25461.85,
-    "opt": 295.35,
-    "reason": "1:1 BOOK",
-    "pnl": 4582.5
-   }
-  ],
-  "booked_pnl": 4582.500000000002
- },
- "done": [],
+ "last_candle": "2026-11-25T14:45:00+05:30",
+ "pos": null,
+ "done": [
+  {
+   "date": "2026-11-25",
+   "trade_no": 1,
+   "side": "PE",
+   "entry_time": "12:40:04",
+   "spot_entry": 25806.15,
+   "sl_spot": 25884.6,
+   "target_spot": 25649.25,
+   "strike": 27200.0,
+   "expiry": "2026-12-01",
+   "delta": -0.697,
+   "option_entry": 1827.15,
+   "lots": 2,
+   "qty_per_lot": 65,
+   "exit_time": "13:15:07",
+   "total_pnl": 0.0,
+   "leg1_lots": 1,
+   "leg1_time": "12:57:37",
+   "leg1_spot": 25727.7,
+   "leg1_option": 1827.15,
+   "leg1_reason": "1:1 BOOK",
+   "leg1_pnl": 0.0,
+   "leg2_lots": 1,
+   "leg2_time": "13:15:07",
+   "leg2_spot": 25648.75,
+   "leg2_option": 1827.15,
+   "leg2_reason": "TARGET",
+   "leg2_pnl": 0.0
+  }
+ ],
  "holiday_checked": true,
- "last_pnl_slot": "2026-11-23T14:55:00+05:30",
- "last_min_slot": "2026-11-23T14:55:00+05:30"
+ "last_pnl_slot": "2026-11-25T13:15:00+05:30",
+ "last_min_slot": "2026-11-25T13:15:00+05:30"
 }
