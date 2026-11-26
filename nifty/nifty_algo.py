@@ -10,10 +10,13 @@ Usage:  python nifty_algo.py 0   -> LIVE (paper) : follows market window 09:20-1
 Rules:
 - ENTRY: 5 min candle close par crossover (upar = CE buy, niche = PE buy).
 - SL = entry candle se pehle ki candle ka low (CE) / high (PE)  [spot par].
-- 1:1 par 1 lot book, bacha lot cost-to-cost (SL = entry spot), target 1:2 (spot par).
-- EXIT (SL / 1:1 / target): spot price touch hote hi, candle close ka wait nahi.
+- 1:1 par 1 lot book. Bacha lot cost-to-cost (SL = entry spot), phir har 5 min candle
+  ke low (CE) / high (PE) par trail. 1:2 par book NAHI hota.
+- SL > MAX_SL_POINTS wali trade nahi li jati ("no trade this time due to SL bada hai").
+- Expiry wale din next expiry ke options mein trade.
+- EXIT (SL / 1:1 / trail): spot price touch hote hi, candle close ka wait nahi.
   Us waqt option ke live price par market-order jaisa paper exit.
-- SL / target se pehle ulta crossover aaye to chalti trade band + nayi trade.
+- SL / trail se pehle ulta crossover aaye to chalti trade band + nayi trade.
 - Live price: Upstox websocket (tick by tick). Na chale to REST (har ~2 sec).
 """
 import os
@@ -36,7 +39,13 @@ SL_CANDLES = 1            # SL = pichhli itni candle (5 min) ka low (CE) / high 
 SL_INCLUDE_ENTRY_CANDLE = False   # False = entry (crossover) candle se PEHLE ki candle
                                   # True  = entry candle bhi gino
 R1 = 1.0                  # is RR par pehla lot book (1:1), spot par
-RR = 2.0                  # bache lot ka target (1:2), spot par
+TRAIL_CANDLES = 1         # 1:1 ke baad bache lot ka SL: pichhli itni 5 min candle ke low (CE) / high (PE) par trail
+MAX_SL_POINTS = 65        # isse bada SL (spot points) ho to trade nahi lenge
+NEXT_EXPIRY_ON_EXPIRY_DAY = True   # expiry wale din next expiry ke option
+MIN_PREMIUM = 80          # option premium (per unit) is range mein hi chunenge
+MAX_PREMIUM = 700         #   (bekar greeks wale deep ITM / bahut sasta strike hat jate hain)
+MAX_STRIKE_DISTANCE = 700 # spot se strike kitne points door tak dekhenge
+DELTA_TOLERANCE = 0.12    # delta TARGET_DELTA se itna hi door tak chalega
 LOTS = 2                  # kul lot (kam se kam 2 rakhna)
 BOOK_LOTS = 1             # R1 par kitne lot book honge; baaki cost-to-cost (SL = entry)
 WINDOW_START = "09:20"    # is time ke baad shuru hue candle ka signal liya jayega
@@ -63,7 +72,7 @@ TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 CSV_COLS = ["date", "trade_no", "side", "entry_time", "spot_entry", "sl_spot",
-            "target_spot", "strike", "expiry", "delta", "option_entry", "lots",
+            "sl_pts", "r1_spot", "strike", "expiry", "delta", "option_entry", "lots",
             "qty_per_lot",
             "leg1_lots", "leg1_time", "leg1_spot", "leg1_option", "leg1_reason",
             "leg1_pnl",
@@ -222,7 +231,9 @@ def contract_info():
     exps = [e for e in exps if e >= today]
     if not exps:
         raise RuntimeError("expiry nahi mili")
-    exp = exps[0]  # current week (aaj expiry ho to aaj ki)
+    exp = exps[0]  # current week
+    if NEXT_EXPIRY_ON_EXPIRY_DAY and exp == today and len(exps) > 1:
+        exp = exps[1]  # aaj expiry hai to next expiry ke option
     lot = DEFAULT_LOT_SIZE
     for c in data:
         if str(c.get("expiry"))[:10] == exp and c.get("lot_size"):
@@ -231,22 +242,36 @@ def contract_info():
     return {"expiry": exp, "lot": lot}
 
 
-def pick_strike(side, expiry):
+def pick_strike(side, expiry, spot=None):
+    """TARGET_DELTA ke sabse paas strike. Bekar greeks wale deep ITM / bahut sasta
+    strike hata dete hain: premium MIN..MAX range mein, spot se
+    MAX_STRIKE_DISTANCE ke andar, delta TARGET_DELTA +- DELTA_TOLERANCE ke andar."""
     rows = api("/v2/option/chain",
                {"instrument_key": SPOT_KEY, "expiry_date": expiry})
+    if spot is None:
+        spot = ltp(SPOT_KEY)
     best = None
+    ignored = 0
     for r in rows or []:
         o = r.get("call_options" if side == "CE" else "put_options") or {}
         g = o.get("option_greeks") or {}
         m = o.get("market_data") or {}
-        d, p = g.get("delta"), m.get("ltp")
-        if d is None or not p or not o.get("instrument_key"):
+        d, p, strike = g.get("delta"), m.get("ltp"), r.get("strike_price")
+        if d is None or not p or strike is None or not o.get("instrument_key"):
             continue
-        diff = abs(abs(float(d)) - TARGET_DELTA)
+        d, p, strike = float(d), float(p), float(strike)
+        diff = abs(abs(d) - TARGET_DELTA)
+        if diff > DELTA_TOLERANCE:
+            continue
+        if (not (MIN_PREMIUM <= p <= MAX_PREMIUM)
+                or abs(strike - spot) > MAX_STRIKE_DISTANCE):
+            ignored += 1          # delta theek dikha par premium/strike bekar
+            continue
         if best is None or diff < best["diff"]:
-            best = {"diff": diff, "strike": r.get("strike_price"),
-                    "key": o["instrument_key"], "delta": float(d),
-                    "ltp": float(p)}
+            best = {"diff": diff, "strike": strike, "key": o["instrument_key"],
+                    "delta": d, "ltp": p, "dist": abs(strike - spot)}
+    if best:
+        best["ignored"] = ignored
     return best
 
 
@@ -424,8 +449,7 @@ def append_pnl_log(row):
 
 def levels(side, entry, candles, k):
     """candles[k] = entry candle. SL = pichhli SL_CANDLES candle ka low (CE) /
-    high (PE). R1 = 1:1 level, tgt = 1:RR level. Sab spot par.
-    Valid na ho to None."""
+    high (PE). R1 = 1:1 level. Sab spot par. Return (sl, r1, risk) ya None."""
     end = k + 1 if SL_INCLUDE_ENTRY_CANDLE else k
     prior = candles[max(0, end - SL_CANDLES):end]
     if not prior:
@@ -435,12 +459,12 @@ def levels(side, entry, candles, k):
         risk = entry - sl
         if risk <= 0:
             return None
-        return sl, entry + R1 * risk, entry + RR * risk
+        return sl, entry + R1 * risk, risk
     sl = max(c["h"] for c in prior)
     risk = sl - entry
     if risk <= 0:
         return None
-    return sl, entry - R1 * risk, entry - RR * risk
+    return sl, entry - R1 * risk, risk
 
 
 # ------------------------------ live trading ------------------------------
@@ -451,19 +475,26 @@ def enter(st, side, cs, ts):
         tg(f"⚠️ nifty: {side} signal aaya par SL valid nahi (spot SL ke "
            f"galat side par). Trade skip.")
         return
-    sl, r1, tgt = lv
+    sl, r1, risk = lv
+    if risk > MAX_SL_POINTS:
+        tg(f"🚫 NIFTY: no trade this time due to SL bada hai\n"
+           f"{side} signal aaya ({ts.strftime('%H:%M')} candle) par SL "
+           f"{risk:.1f} pts hai, limit {MAX_SL_POINTS} pts.")
+        return
     info = contract_info()
-    pick = pick_strike(side, info["expiry"])
+    pick = pick_strike(side, info["expiry"], spot)
     if not pick:
-        tg(f"⚠️ nifty: {side} signal aaya par {TARGET_DELTA} delta wala strike "
-           f"nahi mila (option chain data). Trade skip.")
+        tg(f"⚠️ nifty: {side} signal aaya par {TARGET_DELTA} delta wala sahi "
+           f"strike nahi mila (premium {MIN_PREMIUM}-{MAX_PREMIUM}, spot se "
+           f"{MAX_STRIKE_DISTANCE} pts ke andar). Trade skip.")
         return
     st["trades"] += 1
     st["pos"] = {
         "no": st["trades"], "side": side, "strike": pick["strike"],
         "key": pick["key"], "expiry": info["expiry"], "delta": pick["delta"],
         "lot_size": info["lot"], "lots_total": LOTS, "lots_open": LOTS,
-        "spot_entry": spot, "sl0": sl, "sl": sl, "r1": r1, "tgt": tgt,
+        "spot_entry": spot, "sl0": sl, "sl": sl, "r1": r1, "risk": risk,
+        "strike_dist": pick["dist"],
         "stage": 0, "opt_entry": pick["ltp"],
         "entry_time": now().strftime("%H:%M:%S"),
         "legs": [], "booked_pnl": 0.0,
@@ -476,13 +507,14 @@ def enter(st, side, cs, ts):
        f"Candle: {ts.strftime('%H:%M')} close, EMA {FAST_EMA}/{SLOW_EMA} "
        f"{'upar' if side == 'CE' else 'niche'} cross\n"
        f"Spot: {spot:.2f}\n"
-       f"Strike: {p['strike']} {side} (delta {p['delta']:.2f}), "
-       f"expiry {p['expiry']}\n"
+       f"Strike: {p['strike']:.0f} {side} (spot se {p['strike_dist']:.0f} "
+       f"pts, delta {p['delta']:.2f}), expiry {p['expiry']}\n"
        f"Premium entry: {p['opt_entry']:.2f} | Qty: {p['lot_size'] * LOTS}\n"
        f"SL spot: {sl:.2f} ({abs(spot - sl):.1f} pts)\n"
-       f"1:{R1:g} spot: {r1:.2f} → {BOOK_LOTS} lot book, baaki cost-to-cost\n"
-       f"Target 1:{RR:g} spot: {tgt:.2f}\n"
-       f"(SL/target spot touch hote hi turant exit)")
+       f"1:{R1:g} spot: {r1:.2f} → {BOOK_LOTS} lot book\n"
+       f"Baaki lot: cost-to-cost, phir 5 min candle low/high par trail "
+       f"(1:2 par book nahi)\n"
+       f"(SL/trail spot touch hote hi turant exit)")
 
 
 def close_lots(st, lots, reason, spot=None):
@@ -511,7 +543,8 @@ def finish(st):
     row = {
         "date": st["date"], "trade_no": p["no"], "side": p["side"],
         "entry_time": p["entry_time"], "spot_entry": round(p["spot_entry"], 2),
-        "sl_spot": round(p["sl0"], 2), "target_spot": round(p["tgt"], 2),
+        "sl_spot": round(p["sl0"], 2), "sl_pts": round(p["risk"], 1),
+        "r1_spot": round(p["r1"], 2),
         "strike": p["strike"], "expiry": p["expiry"],
         "delta": round(p["delta"], 3), "option_entry": round(p["opt_entry"], 2),
         "lots": p["lots_total"], "qty_per_lot": p["lot_size"],
@@ -565,7 +598,7 @@ def book_partial(st, spot):
 
 
 def manage(st):
-    """Khuli position: SL / 1:1 book / target. Spot price touch hote hi turant
+    """Khuli position: SL / 1:1 book / trail SL. Spot price touch hote hi turant
     (candle close ka wait nahi)."""
     p = st["pos"]
     spot = FEED.price(SPOT_KEY)
@@ -574,14 +607,37 @@ def manage(st):
     long_ = p["side"] == "CE"
     sl_hit = spot <= p["sl"] if long_ else spot >= p["sl"]
     r1_hit = spot >= p["r1"] if long_ else spot <= p["r1"]
-    t_hit = spot >= p["tgt"] if long_ else spot <= p["tgt"]
     if sl_hit:
-        exit_all(st, "SL" if p["stage"] == 0 else "CTC", spot)
+        if p["stage"] == 0:
+            why = "SL"
+        else:
+            trailed = (p["sl"] > p["spot_entry"] if long_
+                       else p["sl"] < p["spot_entry"])
+            why = "TRAIL" if trailed else "CTC"
+        exit_all(st, why, spot)
         return
     if p["stage"] == 0 and r1_hit:
         book_partial(st, spot)
-    if p["stage"] == 1 and t_hit:
-        exit_all(st, "TARGET", spot)
+
+
+def update_trail(st, cs):
+    """1:1 book ke baad: har 5 min candle close par bache lot ka SL us candle ke
+    low (CE) / high (PE) par (sirf favourable direction mein)."""
+    p = st["pos"]
+    if not p or p["stage"] != 1 or not cs:
+        return
+    last = cs[-TRAIL_CANDLES:]
+    if p["side"] == "CE":
+        new = min(c["l"] for c in last)
+        if new <= p["sl"]:
+            return
+    else:
+        new = max(c["h"] for c in last)
+        if new >= p["sl"]:
+            return
+    p["sl"] = new
+    save_state(st)
+    log(f"Trail SL -> {new:.2f}")
 
 
 def live_numbers(p, opt):
@@ -618,7 +674,8 @@ def pnl_update(st, n):
        f"Live PNL Rs {live:,.2f}\n"
        f"Booked PNL: Rs {p['booked_pnl']:,.2f}\n"
        f"Total: Rs {total:,.2f}\n"
-       f"Spot {spot:.2f} | SL {p['sl']:.2f} | Target {p['tgt']:.2f}")
+       f"Spot {spot:.2f} | SL {p['sl']:.2f}"
+       + (" (cost/trail)" if p["stage"] == 1 else ""))
 
 
 def minute_log(st, n):
@@ -708,9 +765,9 @@ def run_live():
     tg(f"🚀 NIFTY LIVE (paper) shuru\n"
        f"EMA {FAST_EMA}/{SLOW_EMA} | 5 min | delta {TARGET_DELTA} | "
        f"{LOTS} lot\n"
-       f"SL pichhli {SL_CANDLES} candle H/L | 1:{R1:g} par {BOOK_LOTS} lot "
-       f"book, baaki CTC | Target 1:{RR:g} (spot)\n"
-       f"Entry candle close par, SL/target touch par turant exit\n"
+       f"SL pichhli {SL_CANDLES} candle H/L (max {MAX_SL_POINTS} pts) | "
+       f"1:{R1:g} par {BOOK_LOTS} lot book, baaki CTC + 5 min trail\n"
+       f"Entry candle close par, SL/trail touch par turant exit\n"
        f"Price feed: {feed_txt}\n"
        f"Aaj ke trades ab tak: {st['trades']}/{MAX_TRADES}"
        + (" | position khuli hai" if st["pos"] else ""))
@@ -767,6 +824,7 @@ def run_live():
                         else:
                             st["last_candle"] = key
                             save_state(st)
+                            update_trail(st, cs)
                             sig = latest_signal(cs)
                             log("candle", last_start.strftime("%H:%M"),
                                 "crossover:", sig or "koi nahi")
@@ -797,14 +855,16 @@ def run_live():
 
 # ------------------------------ test mode ------------------------------
 def simulate_day(candles, day):
-    """Spot par replay (naye rules): cross -> entry at close, SL pichhli candle,
-    1:1 par BOOK_LOTS book, baaki CTC, target 1:RR, ulta cross = reversal.
-    pts = sab lot ke points ka jod (har lot ke liye alag gina)."""
+    """Spot par replay (naye rules): cross -> entry at close, SL pichhli candle
+    (65 pts se bada ho to no trade), 1:1 par BOOK_LOTS book, baaki CTC phir har
+    candle ke low/high par trail, ulta cross = reversal.
+    pts = sab lot ke points ka jod. Return (trades, skipped)."""
     closes = [c["c"] for c in candles]
     ef = ema_series(closes, FAST_EMA)
     es = ema_series(closes, SLOW_EMA)
     idx = [i for i, c in enumerate(candles) if c["ts"].date() == day]
     out = []
+    skipped = []
     state = {"pos": None, "count": 0}
 
     def pts(side, entry, px):
@@ -827,16 +887,25 @@ def simulate_day(candles, day):
             long_ = p["side"] == "CE"
             sl_hit = c["l"] <= p["sl"] if long_ else c["h"] >= p["sl"]
             r1_hit = c["h"] >= p["r1"] if long_ else c["l"] <= p["r1"]
-            t_hit = c["h"] >= p["tgt"] if long_ else c["l"] <= p["tgt"]
             if sl_hit:
-                close(p["sl"], "SL" if p["stage"] == 0 else "CTC", p["open"])
-            else:
-                if p["stage"] == 0 and r1_hit:
-                    close(p["r1"], "1:1", BOOK_LOTS)
-                    p["stage"] = 1
-                    p["sl"] = p["entry"]
-                if state["pos"] and p["stage"] == 1 and t_hit:
-                    close(p["tgt"], "TARGET", p["open"])
+                if p["stage"] == 0:
+                    why = "SL"
+                else:
+                    trailed = (p["sl"] > p["entry"] if long_
+                               else p["sl"] < p["entry"])
+                    why = "TRAIL" if trailed else "CTC"
+                close(p["sl"], why, p["open"])
+            elif p["stage"] == 0 and r1_hit:
+                close(p["r1"], "1:1", BOOK_LOTS)
+                p["stage"] = 1
+                p["sl"] = p["entry"]
+            p = state["pos"]
+            if p and p["stage"] == 1:          # candle close par trail
+                last = candles[max(0, k + 1 - TRAIL_CANDLES):k + 1]
+                if p["side"] == "CE":
+                    p["sl"] = max(p["sl"], min(x["l"] for x in last))
+                else:
+                    p["sl"] = min(p["sl"], max(x["h"] for x in last))
 
         in_win = (at(day, WINDOW_START) <= c["ts"] <= at(day, LAST_CANDLE_START))
         sig = cross_at(ef, es, k) if in_win else None
@@ -847,17 +916,21 @@ def simulate_day(candles, day):
             if not state["pos"] and state["count"] < MAX_TRADES:
                 lv = levels(sig, c["c"], candles, k)
                 if lv:
-                    state["count"] += 1
-                    state["pos"] = {
-                        "side": sig, "entry": c["c"], "sl": lv[0], "r1": lv[1],
-                        "tgt": lv[2], "stage": 0, "open": LOTS, "pts": 0.0,
-                        "legs": [], "t": c["ts"].strftime("%H:%M")}
+                    if lv[2] > MAX_SL_POINTS:
+                        skipped.append({"t": c["ts"].strftime("%H:%M"),
+                                        "side": sig, "risk": lv[2]})
+                    else:
+                        state["count"] += 1
+                        state["pos"] = {
+                            "side": sig, "entry": c["c"], "sl": lv[0],
+                            "r1": lv[1], "stage": 0, "open": LOTS, "pts": 0.0,
+                            "legs": [], "t": c["ts"].strftime("%H:%M")}
         p = state["pos"]
         if p and c["ts"] >= at(day, LAST_CANDLE_START):
             close(c["c"], "TIME", p["open"])
     if state["pos"]:
         close(candles[idx[-1]]["c"], "TIME(open)", state["pos"]["open"])
-    return out
+    return out, skipped
 
 
 def run_test():
@@ -865,11 +938,14 @@ def run_test():
          f"Time: {now().strftime('%d-%b %H:%M')}"]
     L.append(f"Settings: EMA {FAST_EMA}/{SLOW_EMA}, delta {TARGET_DELTA}, "
              f"{LOTS} lot, SL pichhli {SL_CANDLES} candle H/L, "
-             f"1:{R1:g} par {BOOK_LOTS} lot book + CTC, target 1:{RR:g}, "
+             f"1:{R1:g} par {BOOK_LOTS} lot book + CTC/5 min trail, "
+             f"max SL {MAX_SL_POINTS} pts, "
              f"max {MAX_TRADES} trades")
 
+    spot_now = None
     try:
-        L.append(f"✅ Upstox token OK | Nifty spot: {ltp(SPOT_KEY):.2f}")
+        spot_now = ltp(SPOT_KEY)
+        L.append(f"✅ Upstox token OK | Nifty spot: {spot_now:.2f}")
     except Exception as e:
         L.append(f"❌ Upstox token/spot error: {str(e)[:120]}")
 
@@ -906,13 +982,18 @@ def run_test():
         info = contract_info()
         L.append(f"✅ Expiry: {info['expiry']} | Lot size: {info['lot']}")
         for side in ("CE", "PE"):
-            p = pick_strike(side, info["expiry"])
+            p = pick_strike(side, info["expiry"], spot_now)
             if p:
-                L.append(f"✅ {side}: strike {p['strike']}, delta "
-                         f"{p['delta']:.2f}, premium {p['ltp']:.2f}")
+                L.append(f"✅ {side}: strike {p['strike']:.0f} (spot se "
+                         f"{p['dist']:.0f} pts), delta {p['delta']:.2f}, "
+                         f"premium {p['ltp']:.2f}"
+                         + (f" | {p['ignored']} bekar strike hataye"
+                            if p.get("ignored") else ""))
             else:
-                L.append(f"⚠️ {side}: delta/premium data nahi mila "
-                         f"(market band ho to normal hai)")
+                L.append(f"⚠️ {side}: sahi strike nahi mila (premium "
+                         f"{MIN_PREMIUM}-{MAX_PREMIUM}, delta "
+                         f"{TARGET_DELTA}+-{DELTA_TOLERANCE}). Market band ho "
+                         f"to normal hai)")
     except Exception as e:
         L.append(f"❌ Option data error: {str(e)[:120]}")
 
@@ -923,9 +1004,12 @@ def run_test():
         else:
             day = cs[-1]["ts"].date()
             L.append(f"✅ Candles OK ({len(cs)}), replay din: {day}")
-            res = simulate_day(cs, day)
-            if not res:
+            res, skipped = simulate_day(cs, day)
+            if not res and not skipped:
                 L.append("Replay: us din koi trade nahi (window 9:20-15:15)")
+            for s_ in skipped:
+                L.append(f"• {s_['t']} {s_['side']} signal: no trade "
+                         f"(SL {s_['risk']:.0f} pts bada hai)")
             for r in res:
                 L.append(f"• {r['t']} {r['side']} entry {r['entry']:.1f} → "
                          f"{r['legs']} = {r['pts']:+.1f} pts")
